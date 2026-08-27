@@ -167,3 +167,4 @@ Desktop.ini
 # Misc
 .coze-logs
 .codegraph/
+_tmp_*
