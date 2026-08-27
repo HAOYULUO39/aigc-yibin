@@ -1,128 +1,198 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { execSync } from 'child_process';
-import { getReportBuffer, createWrappedFetch } from 'coze-coding-dev-sdk';
+import { Pool } from 'pg';
 
-let envLoaded = false;
+/**
+ * 本地 PostgreSQL 数据库适配层
+ *
+ * 原实现通过 Supabase JS Client（REST API）访问云数据库，
+ * 现改为直接连接本地 PostgreSQL，保持 getSupabaseClient() 调用方式不变，
+ * API 路由代码无需任何改动。
+ *
+ * 连接配置：环境变量 DATABASE_URL（默认 postgres://postgres:postgres@127.0.0.1:5432/aigc_yibin）
+ */
 
-interface SupabaseCredentials {
-  url: string;
-  anonKey: string;
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ||
+    'postgres://postgres:postgres@127.0.0.1:5432/aigc_yibin',
+  max: 10,
+  idleTimeoutMillis: 30000,
+});
+
+type WhereClause = { column: string; operator: string; value: unknown };
+
+interface QueryResult<T> {
+  data: T | null;
+  error: unknown | null;
 }
 
-function loadEnv(): void {
-  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)) {
-    return;
+/**
+ * 链式查询构建器，兼容 Supabase 的 from().select().eq()... 调用风格。
+ * thenable：await 后返回 { data, error }。
+ */
+class LocalQueryBuilder<T = any> implements PromiseLike<QueryResult<T>> {
+  private table: string;
+  private mode: 'select' | 'insert' | 'upsert' | 'delete' = 'select';
+  private columns = '*';
+  private wheres: WhereClause[] = [];
+  private orderBys: { column: string; ascending: boolean }[] = [];
+  private limit: number | null = null;
+  private offset: number | null = null;
+  private single = false;
+  private insertData: Record<string, unknown> | null = null;
+  private onConflict: string | null = null;
+
+  constructor(table: string) {
+    this.table = table;
   }
 
-  try {
-    try {
-      require('dotenv').config();
-      if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
-        envLoaded = true;
-        return;
-      }
-    } catch {
-      // dotenv not available
-    }
+  select(columns: string): this {
+    this.columns = columns;
+    return this;
+  }
 
-    const pythonCode = `
-import os
-import sys
-try:
-    from coze_workload_identity import Client
-    client = Client()
-    env_vars = client.get_project_env_vars()
-    client.close()
-    for env_var in env_vars:
-        print(f"{env_var.key}={env_var.value}")
-except Exception as e:
-    print(f"# Error: {e}", file=sys.stderr)
-`;
+  eq(column: string, value: unknown): this {
+    this.wheres.push({ column, operator: '=', value });
+    return this;
+  }
 
-    const output = execSync(`python3 -c '${pythonCode.replace(/'/g, "'\"'\"'")}'`, {
-      encoding: 'utf-8',
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
+  neq(column: string, value: unknown): this {
+    this.wheres.push({ column, operator: '<>', value });
+    return this;
+  }
+
+  order(column: string, opts?: { ascending?: boolean }): this {
+    this.orderBys.push({ column, ascending: opts?.ascending ?? true });
+    return this;
+  }
+
+  range(from: number, to: number): this {
+    this.offset = from;
+    this.limit = to - from + 1;
+    return this;
+  }
+
+  maybeSingle(): this {
+    this.single = true;
+    return this;
+  }
+
+  insert(data: Record<string, unknown>): this {
+    this.mode = 'insert';
+    this.insertData = data;
+    return this;
+  }
+
+  upsert(data: Record<string, unknown>, opts?: { onConflict?: string }): this {
+    this.mode = 'upsert';
+    this.insertData = data;
+    this.onConflict = opts?.onConflict ?? null;
+    return this;
+  }
+
+  delete(): this {
+    this.mode = 'delete';
+    return this;
+  }
+
+  then<TResult1 = QueryResult<T>, TResult2 = never>(
+    onfulfilled?: ((value: QueryResult<T>) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+
+  private buildWhereClause(): { clause: string; params: unknown[] } {
+    const params: unknown[] = [];
+    const conds = this.wheres.map((w) => {
+      params.push(w.value);
+      return `${w.column} ${w.operator} $${params.length}`;
     });
+    return { clause: conds.join(' AND '), params };
+  }
 
-    const lines = output.trim().split('\n');
-    for (const line of lines) {
-      if (line.startsWith('#')) continue;
-      const eqIndex = line.indexOf('=');
-      if (eqIndex > 0) {
-        const key = line.substring(0, eqIndex);
-        let value = line.substring(eqIndex + 1);
-        if ((value.startsWith("'") && value.endsWith("'")) ||
-            (value.startsWith('"') && value.endsWith('"'))) {
-          value = value.slice(1, -1);
+  private async execute(): Promise<QueryResult<T>> {
+    let client;
+    try {
+      client = await pool.connect();
+      const { clause, params } = this.buildWhereClause();
+
+      if (this.mode === 'select') {
+        const cols =
+          this.columns.trim() === '*'
+            ? '*'
+            : this.columns
+                .split(',')
+                .map((c) => c.trim())
+                .join(', ');
+        let sql = `SELECT ${cols} FROM ${this.table}`;
+        if (clause) sql += ` WHERE ${clause}`;
+        if (this.orderBys.length) {
+          sql +=
+            ' ORDER BY ' +
+            this.orderBys
+              .map((o) => `${o.column} ${o.ascending ? 'ASC' : 'DESC'}`)
+              .join(', ');
         }
-        if (!process.env[key]) {
-          process.env[key] = value;
+        if (this.limit !== null) {
+          params.push(this.limit);
+          sql += ` LIMIT $${params.length}`;
         }
+        if (this.offset !== null) {
+          params.push(this.offset);
+          sql += ` OFFSET $${params.length}`;
+        }
+        const res = await client.query(sql, params);
+        const rows = res.rows as T[];
+        return { data: this.single ? ((rows[0] ?? null) as T) : rows, error: null };
       }
+
+      if (this.mode === 'insert' || this.mode === 'upsert') {
+        const keys = Object.keys(this.insertData ?? {});
+        if (keys.length === 0) {
+          return { data: null, error: new Error('empty insert data') };
+        }
+        const values = keys.map((k) => this.insertData![k]);
+        const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+        let sql = `INSERT INTO ${this.table} (${keys.join(', ')}) VALUES (${placeholders})`;
+
+        if (this.mode === 'upsert' && this.onConflict) {
+          const conflictCol = this.onConflict;
+          const updateCols = keys.filter((k) => k !== conflictCol);
+          if (updateCols.length) {
+            sql += ` ON CONFLICT (${conflictCol}) DO UPDATE SET ${updateCols
+              .map((k) => `${k} = EXCLUDED.${k}`)
+              .join(', ')}`;
+          } else {
+            sql += ` ON CONFLICT (${conflictCol}) DO NOTHING`;
+          }
+        }
+        await client.query(sql, values);
+        return { data: null, error: null };
+      }
+
+      if (this.mode === 'delete') {
+        let sql = `DELETE FROM ${this.table}`;
+        if (clause) sql += ` WHERE ${clause}`;
+        await client.query(sql, params);
+        return { data: null, error: null };
+      }
+
+      return { data: null, error: new Error('unknown mode') };
+    } catch (e) {
+      console.error('[local-db] query error:', e);
+      return { data: null, error: e };
+    } finally {
+      if (client) client.release();
     }
-
-    envLoaded = true;
-  } catch {
-    // Silently fail
   }
 }
 
-function getSupabaseCredentials(): SupabaseCredentials {
-  loadEnv();
-
-  const url = process.env.COZE_SUPABASE_URL;
-  const anonKey = process.env.COZE_SUPABASE_ANON_KEY;
-
-  if (!url) {
-    throw new Error('COZE_SUPABASE_URL is not set');
-  }
-  if (!anonKey) {
-    throw new Error('COZE_SUPABASE_ANON_KEY is not set');
-  }
-
-  return { url, anonKey };
-}
-
-function getSupabaseServiceRoleKey(): string | undefined {
-  loadEnv();
-  return process.env.COZE_SUPABASE_SERVICE_ROLE_KEY;
-}
-
-function getSupabaseClient(token?: string): SupabaseClient {
-  const { url, anonKey } = getSupabaseCredentials();
-
-  let key: string;
-  if (token) {
-    key = anonKey;
-  } else {
-    const serviceRoleKey = getSupabaseServiceRoleKey();
-    key = serviceRoleKey ?? anonKey;
-  }
-
-  const globalOptions: Record<string, any> = {};
-  if (token) {
-    globalOptions.headers = { Authorization: `Bearer ${token}` };
-  }
-  try {
-    const buffer = getReportBuffer();
-    if (buffer) {
-      globalOptions.fetch = createWrappedFetch(buffer, 'supabase');
-    }
-  } catch {
-    // Silent — reporting setup failure should not block client creation
-  }
-
-  return createClient(url, key, {
-    global: globalOptions,
-    db: {
-      timeout: 60000,
+function getSupabaseClient() {
+  return {
+    from<T = any>(table: string): LocalQueryBuilder<T> {
+      return new LocalQueryBuilder<T>(table);
     },
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  });
+  };
 }
 
-export { loadEnv, getSupabaseCredentials, getSupabaseServiceRoleKey, getSupabaseClient };
+export { getSupabaseClient };
